@@ -5,10 +5,9 @@ import time
 from datetime import datetime
 import requests
 from flask import Flask, request, jsonify, Response, send_file
-from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.pdfgen import canvas
-from reportlab.graphics.shapes import Drawing, Rect
+from reportlab.graphics.shapes import Drawing
 from reportlab.graphics.barcode import qr
 
 app = Flask(__name__)
@@ -16,26 +15,100 @@ app = Flask(__name__)
 session = requests.Session()
 
 
+def normalize_rc_data(raw_data: dict) -> dict:
+    """Normalize fields from both API response formats into a standard dict."""
+    # Agar data nested 'data' key ke andar hai (secondary API format)
+    d = raw_data.get("data", raw_data) if isinstance(raw_data, dict) else {}
+
+    reg_no = d.get("regNo") or d.get("Registration_Number") or d.get("registration_number") or ""
+    reg_date = d.get("regDate") or d.get("Registration_Date") or d.get("RegistrationDate") or ""
+    chassis = d.get("chassis") or d.get("Chassis_Number") or ""
+    engine = d.get("engine") or d.get("Engin_Number") or d.get("Engine_Number") or ""
+    owner = d.get("owner") or d.get("Owner_Name") or ""
+    father = d.get("ownerFatherName") or d.get("Father_Name") or ""
+    
+    address = (
+        d.get("presentAddress")
+        or d.get("Permanent_Address")
+        or d.get("Communication_Address")
+        or d.get("permAddress")
+        or ""
+    )
+    
+    fuel = d.get("fuelType") or d.get("Fuel_Type") or d.get("Fuel_Name") or "PETROL"
+    v_class = d.get("vehicleClass") or d.get("Vehicle_Class_Core") or d.get("Vehicle_Class") or "M-CYCLE/SCOOTER"
+    maker = d.get("manufacturer") or d.get("Make_Name") or d.get("Vahan_Make") or ""
+    model = d.get("vehicle") or d.get("Model_Name") or d.get("Vahan_Model") or ""
+    color = d.get("color") or d.get("Color") or "WHITE"
+    seat = str(d.get("seatCapacity") or d.get("Seating_Capacity") or d.get("Vahan_Seating_Capacity") or "2")
+    unladen = str(d.get("unladenWeight") or d.get("Vahan_GVW") or "150")
+    cc = str(d.get("cubicCapacity") or d.get("Cubic_Capacity") or d.get("Vahan_Cubic_Capacity") or "0")
+    
+    m_month = str(d.get("Manufacture_Month") or "")
+    m_year = str(d.get("Manufacture_Year") or d.get("Year") or "")
+    mfg_my = f"{m_month}/{m_year}".strip("/") if (m_month or m_year) else d.get("manufacturerMonthYear", "")
+
+    rto_name = d.get("RTO_Name") or d.get("CityofRegitration") or d.get("citycamal") or ""
+    rto_data = d.get("rtoData", {})
+    state_name = rto_data.get("statename", "") if isinstance(rto_data, dict) else ""
+    if not state_name and rto_name:
+        state_name = rto_name
+
+    expiry = d.get("insuranceUpto") or d.get("Pyp_Policy_Expiry_Date") or ""
+
+    return {
+        "regNo": reg_no.strip().upper(),
+        "regDate": reg_date.strip(),
+        "insuranceUpto": expiry.strip(),
+        "chassis": chassis.replace("~", " ").strip(),
+        "engine": engine.strip(),
+        "owner": "" if owner.upper() in ["NA", "NULL", "NONE"] else owner.strip(),
+        "ownerFatherName": "" if father.upper() in ["NA", "NULL", "NONE"] else father.strip(),
+        "address": address.strip(),
+        "fuelType": fuel.strip().upper(),
+        "vehicleClass": v_cat_format(v_class),
+        "maker": maker.strip().upper(),
+        "model": model.strip().upper(),
+        "color": color.strip().upper(),
+        "seatCapacity": seat.strip(),
+        "unladenWeight": unladen.strip(),
+        "cubicCapacity": cc.strip(),
+        "mfgMonthYear": mfg_my.strip(),
+        "stateName": state_name.strip() if state_name else "India",
+        "regAuthority": rto_name.strip(),
+    }
+
+
+def v_cat_format(val: str) -> str:
+    val_upper = str(val).upper()
+    if "2WN" in val_upper or "SCOOTER" in val_upper or "CYCLE" in val_upper:
+        return "TWO WHEELER(NT)"
+    return val_upper
+
+
 def fetch_rc_data(vehicle_no: str) -> dict:
+    # --- ATTEMPT 1: Primary API ---
     api_1_url = "https://vahanapi.vk177384.workers.dev/"
     try:
-        resp1 = session.get(api_1_url, params={"vehicle_no": vehicle_no}, timeout=8)
+        resp1 = session.get(api_1_url, params={"vehicle_no": vehicle_no}, timeout=6)
         if resp1.status_code == 200:
             data1 = resp1.json()
             if data1.get("statusCode") == 200 and "response" in data1:
-                return data1["response"]
+                return normalize_rc_data(data1["response"])
     except Exception:
         pass
 
+    # --- ATTEMPT 2: Secondary API (Fallback) ---
     api_2_url = "https://vehiclev2.vk177384.workers.dev/"
     try:
-        resp2 = session.get(api_2_url, params={"number": vehicle_no, "api_key": "sneha"}, timeout=8)
+        resp2 = session.get(api_2_url, params={"number": vehicle_no, "api_key": "sneha"}, timeout=6)
         if resp2.status_code == 200:
             data2 = resp2.json()
-            if data2.get("statusCode") == 200 and "response" in data2:
-                return data2["response"]
-            elif "regNo" in data2 or "chassis" in data2:
-                return data2
+            # Handle standard wrapper or direct data wrapper
+            if data2.get("status") == "Success" or "data" in data2 or "registration_number" in data2:
+                return normalize_rc_data(data2)
+            elif data2.get("statusCode") == 200 and "response" in data2:
+                return normalize_rc_data(data2["response"])
     except Exception:
         pass
 
@@ -45,6 +118,7 @@ def fetch_rc_data(vehicle_no: str) -> dict:
 def format_date_to_card(date_str: str) -> str:
     if not date_str:
         return ""
+    date_str = date_str.replace("-", "/")
     months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
     parts = date_str.split("/")
@@ -63,40 +137,37 @@ def format_date_to_card(date_str: str) -> str:
 def card_issue_date(regn_dt: str) -> str:
     if not regn_dt:
         return ""
+    regn_dt = regn_dt.replace("-", "/")
     parts = regn_dt.split("/")
     if len(parts) == 3:
         return f"{parts[1].zfill(2)}-{parts[2]}"
     return regn_dt
 
 
-def generate_rc_pdf_bytes(data: dict) -> bytes:
+def generate_rc_pdf_bytes(d: dict) -> bytes:
     buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=(842, 595)) # Landscape A4
+    c = canvas.Canvas(buf, pagesize=(842, 595))
 
-    # Extract RC Data
-    rto_data = data.get("rtoData", {})
-    state_name = rto_data.get("statename", "India").strip() if rto_data else "India"
-    regn_no = data.get("regNo", "").strip().upper()
-    regn_dt = format_date_to_card(data.get("regDate", "").strip())
-    validity = format_date_to_card(data.get("insuranceUpto", "").strip())
-    chassis = data.get("chassis", "").replace("~", " ").strip()
-    engine_no = data.get("engine", "").strip()
-    owner_name = data.get("owner", "").strip()
-    father_name = data.get("ownerFatherName", "").strip()
-    if father_name.upper() == "NA":
-        father_name = ""
-    address = data.get("presentAddress", "").strip() or data.get("permAddress", "").strip()
-    fuel = data.get("fuelType", "").strip().upper() or "PETROL"
-    veh_cat = data.get("vehicleClass", "").strip() or "TWO WHEELER(NT)"
-    maker = data.get("manufacturer", "").strip()
-    model = data.get("vehicle", "").strip()
-    color = "WHITE"
-    seat_cap = str(data.get("seatCapacity", "2")).strip()
-    unld_wt = str(data.get("unladenWeight", "110")).strip()
-    cubic_cap = str(data.get("cubicCapacity", "0.0")).strip()
-    mfg_my = data.get("manufacturerMonthYear", "").strip() or "4/2011"
-    reg_authority = data.get("regAuthority", "").strip()
-    issue_date = card_issue_date(data.get("regDate", "").strip())
+    regn_no = d.get("regNo", "")
+    regn_dt = format_date_to_card(d.get("regDate", ""))
+    validity = format_date_to_card(d.get("insuranceUpto", ""))
+    chassis = d.get("chassis", "")
+    engine_no = d.get("engine", "")
+    owner_name = d.get("owner", "")
+    father_name = d.get("ownerFatherName", "")
+    address = d.get("address", "")
+    fuel = d.get("fuelType", "PETROL")
+    veh_cat = d.get("vehicleClass", "TWO WHEELER(NT)")
+    maker = d.get("maker", "")
+    model = d.get("model", "")
+    color = d.get("color", "WHITE")
+    seat_cap = d.get("seatCapacity", "2")
+    unld_wt = d.get("unladenWeight", "150")
+    cubic_cap = d.get("cubicCapacity", "0")
+    mfg_my = d.get("mfgMonthYear", "")
+    state_name = d.get("stateName", "India")
+    reg_authority = d.get("regAuthority", "")
+    issue_date = card_issue_date(d.get("regDate", ""))
 
     card_w, card_h = 360, 225
     y_pos = 185
@@ -123,7 +194,7 @@ def generate_rc_pdf_bytes(data: dict) -> bytes:
     c.setFillColor(colors.white)
     c.setFont("Helvetica-Bold", 7)
     c.drawCentredString(x1 + card_w - 38, y_pos + card_h - 28, "NT")
-    c.drawCentredString(x1 + card_w - 16, y_pos + card_h - 28, "RJ")
+    c.drawCentredString(x1 + card_w - 16, y_pos + card_h - 28, regn_no[:2] if len(regn_no) >= 2 else "IND")
 
     # Front Details Grid
     c.setFillColor(colors.black)
@@ -164,7 +235,7 @@ def generate_rc_pdf_bytes(data: dict) -> bytes:
     # Address
     c.setFont("Helvetica-Bold", 7.5)
     c.drawString(x1 + 15, y_pos + 78, "Address:")
-    c.setFont("Helvetica", 7)
+    c.setFont("Helvetica", 7.5)
     addr_line1 = address[:45]
     addr_line2 = address[45:90]
     c.drawString(x1 + 115, y_pos + 78, addr_line1)
@@ -196,9 +267,9 @@ def generate_rc_pdf_bytes(data: dict) -> bytes:
     qr_code = qr.QrCodeWidget(f"RC:{regn_no}|CH:{chassis}|ENG:{engine_no}")
     qr_code.barWidth = 65
     qr_code.barHeight = 65
-    d = Drawing(65, 65)
-    d.add(qr_code)
-    d.drawOn(c, x2 + 15, y_pos + 95)
+    d_obj = Drawing(65, 65)
+    d_obj.add(qr_code)
+    d_obj.drawOn(c, x2 + 15, y_pos + 95)
 
     # Back Specs
     c.setFillColor(colors.black)
@@ -210,12 +281,12 @@ def generate_rc_pdf_bytes(data: dict) -> bytes:
     c.setFont("Helvetica-Bold", 7.5)
     c.drawString(x2 + 100, y_pos + 165, "Maker:")
     c.setFont("Helvetica", 7.5)
-    c.drawString(x2 + 150, y_pos + 165, maker)
+    c.drawString(x2 + 150, y_pos + 165, maker[:30])
 
     c.setFont("Helvetica-Bold", 7.5)
     c.drawString(x2 + 100, y_pos + 150, "Model:")
     c.setFont("Helvetica", 7.5)
-    c.drawString(x2 + 150, y_pos + 150, model)
+    c.drawString(x2 + 150, y_pos + 150, model[:30])
 
     c.setFont("Helvetica-Bold", 7.5)
     c.drawString(x2 + 100, y_pos + 135, "Color / Body:")
@@ -287,7 +358,10 @@ def rc_pdf():
 
 @app.route("/")
 def index():
-    return jsonify({"message": "Fast Direct PDF API Running", "route": "/rc?vehicle=MH01AB1234"})
+    return jsonify({
+        "status": "online",
+        "endpoint": "/rc?vehicle=AP07CW1616"
+    })
 
 
 if __name__ == "__main__":
