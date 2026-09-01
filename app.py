@@ -1,26 +1,25 @@
 import io
 import os
-import re
-import random
 import base64
 import time
 from datetime import datetime
 import requests
 from flask import Flask, request, jsonify, Response, send_file
-from PIL import Image
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.pdfgen import canvas
+from reportlab.graphics.shapes import Drawing, Rect
+from reportlab.graphics.barcode import qr
 
 app = Flask(__name__)
 
-# Image API Configurations
-IMG_API_URL = "https://www.allimagetools.com/api/html-to-image"
-TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "template.html")
+session = requests.Session()
 
 
 def fetch_rc_data(vehicle_no: str) -> dict:
-    # --- ATTEMPT 1: Primary API ---
     api_1_url = "https://vahanapi.vk177384.workers.dev/"
     try:
-        resp1 = requests.get(api_1_url, params={"vehicle_no": vehicle_no}, timeout=30)
+        resp1 = session.get(api_1_url, params={"vehicle_no": vehicle_no}, timeout=8)
         if resp1.status_code == 200:
             data1 = resp1.json()
             if data1.get("statusCode") == 200 and "response" in data1:
@@ -28,10 +27,9 @@ def fetch_rc_data(vehicle_no: str) -> dict:
     except Exception:
         pass
 
-    # --- ATTEMPT 2: Secondary API (Fallback) ---
     api_2_url = "https://vehiclev2.vk177384.workers.dev/"
     try:
-        resp2 = requests.get(api_2_url, params={"number": vehicle_no, "api_key": "sneha"}, timeout=30)
+        resp2 = session.get(api_2_url, params={"number": vehicle_no, "api_key": "sneha"}, timeout=8)
         if resp2.status_code == 200:
             data2 = resp2.json()
             if data2.get("statusCode") == 200 and "response" in data2:
@@ -41,29 +39,7 @@ def fetch_rc_data(vehicle_no: str) -> dict:
     except Exception:
         pass
 
-    raise ValueError(f"No data found or both APIs failed for vehicle {vehicle_no!r}")
-
-
-def mfg_month_year(raw: str) -> str:
-    if not raw:
-        return ""
-    return raw
-
-
-def extract_state(rto_data: dict) -> str:
-    if not rto_data:
-        return "India"
-    return rto_data.get("statename", "India").strip()
-
-
-def card_issue_date(regn_dt: str) -> str:
-    if not regn_dt:
-        return ""
-    parts = regn_dt.split("/")
-    if len(parts) == 3:
-        month = parts[1].zfill(2)
-        return f"{month}-{parts[2]}"
-    return regn_dt
+    raise ValueError(f"No data found or APIs failed for vehicle {vehicle_no!r}")
 
 
 def format_date_to_card(date_str: str) -> str:
@@ -84,176 +60,196 @@ def format_date_to_card(date_str: str) -> str:
     return date_str
 
 
-def split_address(address_str: str, max_chars: int = 35) -> tuple:
-    if len(address_str) <= max_chars:
-        return address_str, ""
-
-    break_idx = address_str.rfind(" ", 0, max_chars)
-    if break_idx == -1:
-        break_idx = max_chars
-
-    line1 = address_str[:break_idx].strip()
-    line2 = address_str[break_idx:].strip()
-
-    if len(line2) > 45:
-        line2 = line2[:42] + "..."
-
-    return line1, line2
+def card_issue_date(regn_dt: str) -> str:
+    if not regn_dt:
+        return ""
+    parts = regn_dt.split("/")
+    if len(parts) == 3:
+        return f"{parts[1].zfill(2)}-{parts[2]}"
+    return regn_dt
 
 
-def build_html(data: dict) -> str:
-    with open(TEMPLATE, "r", encoding="utf-8") as f:
-        html = f.read()
+def generate_rc_pdf_bytes(data: dict) -> bytes:
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(842, 595)) # Landscape A4
 
-    rto_data      = data.get("rtoData", {})
-    regn_no       = data.get("regNo", "").strip()
-
-    raw_reg_date  = data.get("regDate", "").strip()
-    regn_dt       = format_date_to_card(raw_reg_date)
-
-    raw_expiry    = data.get("insuranceUpto", "").strip()
-    validity      = format_date_to_card(raw_expiry)
-
-    chassis       = data.get("chassis", "").replace("~", " ").strip()
-    engine_no     = data.get("engine", "").strip()
-    owner_name    = data.get("owner", "").strip()
-    father_name   = data.get("ownerFatherName", "").strip()
-    if father_name.upper() == "NA" or not father_name:
+    # Extract RC Data
+    rto_data = data.get("rtoData", {})
+    state_name = rto_data.get("statename", "India").strip() if rto_data else "India"
+    regn_no = data.get("regNo", "").strip().upper()
+    regn_dt = format_date_to_card(data.get("regDate", "").strip())
+    validity = format_date_to_card(data.get("insuranceUpto", "").strip())
+    chassis = data.get("chassis", "").replace("~", " ").strip()
+    engine_no = data.get("engine", "").strip()
+    owner_name = data.get("owner", "").strip()
+    father_name = data.get("ownerFatherName", "").strip()
+    if father_name.upper() == "NA":
         father_name = ""
-
-    present_addr  = data.get("presentAddress", "").strip()
-    perm_addr     = data.get("permAddress", "").strip()
-    full_address  = present_addr if len(present_addr) >= len(perm_addr) else perm_addr
-
-    addr_line1, addr_line2 = split_address(full_address, max_chars=35)
-
-    fuel          = data.get("fuelType", "").strip().upper()
-    norms         = "BHARAT STAGE IV"
-    veh_cat       = data.get("vehicleClass", "").strip()
-    maker         = data.get("manufacturer", "").strip()
-    model         = data.get("vehicle", "").strip()
-    color         = "WHITE"
-    body_type     = "SALOON"
-
-    seat_cap      = str(data.get("seatCapacity", "5")).strip()
-    unld_wt       = str(data.get("unladenWeight", "1500")).strip()
-    cubic_cap     = str(data.get("cubicCapacity", "")).strip()
-    no_cyl        = "4"
-
-    mfg_my        = mfg_month_year(data.get("manufacturerMonthYear", ""))
+    address = data.get("presentAddress", "").strip() or data.get("permAddress", "").strip()
+    fuel = data.get("fuelType", "").strip().upper() or "PETROL"
+    veh_cat = data.get("vehicleClass", "").strip() or "TWO WHEELER(NT)"
+    maker = data.get("manufacturer", "").strip()
+    model = data.get("vehicle", "").strip()
+    color = "WHITE"
+    seat_cap = str(data.get("seatCapacity", "2")).strip()
+    unld_wt = str(data.get("unladenWeight", "110")).strip()
+    cubic_cap = str(data.get("cubicCapacity", "0.0")).strip()
+    mfg_my = data.get("manufacturerMonthYear", "").strip() or "4/2011"
     reg_authority = data.get("regAuthority", "").strip()
-    issue_date    = card_issue_date(raw_reg_date)
-    state_name    = extract_state(rto_data)
+    issue_date = card_issue_date(data.get("regDate", "").strip())
 
-    html = html.replace(">Government of Rajasthan<",   f">Government of {state_name}<")
-    html = html.replace(">RJ06SQ4302<",                f">{regn_no}<")
-    html = html.replace(">27-Apr-2011<",               f">{regn_dt}<")
-    html = html.replace(">26-Apr-2026<",               f">{validity}<")
-    html = html.replace(">MD626AG45B1C19003<",         f">{chassis}<")
-    html = html.replace(">064CB1121025<",              f">{engine_no}<")
-    html = html.replace(">SH HAMID KHAN<",             f">{owner_name}<")
-    html = html.replace(">UMAID KHA KAYAMKHANI<",      f">{father_name}<")
+    card_w, card_h = 360, 225
+    y_pos = 185
 
-    html = re.sub(
-        r'(ff1 fs2 fc0 sc0 ls0 ws0">), 311001(<)',
-        lambda m: m.group(1) + addr_line1 + m.group(2),
-        html
-    )
+    # ---------------- FRONT CARD ----------------
+    x1 = 45
+    c.setStrokeColor(colors.HexColor("#222222"))
+    c.setLineWidth(1)
+    c.setFillColor(colors.HexColor("#eef7fc"))
+    c.roundRect(x1, y_pos, card_w, card_h, 8, fill=1, stroke=1)
 
+    # Header
+    c.setFillColor(colors.HexColor("#002855"))
+    c.setFont("Helvetica-Bold", 10)
+    c.drawCentredString(x1 + 180, y_pos + card_h - 20, "Indian Union Vehicle Registration Certificate")
+    c.setFont("Helvetica-Bold", 9)
+    c.drawCentredString(x1 + 180, y_pos + card_h - 34, f"Issued by Government of {state_name}")
+
+    # Badges
+    c.setFillColor(colors.HexColor("#00a8e8"))
+    c.circle(x1 + card_w - 38, y_pos + card_h - 25, 9, fill=1, stroke=0)
+    c.setFillColor(colors.HexColor("#f39c12"))
+    c.circle(x1 + card_w - 16, y_pos + card_h - 25, 9, fill=1, stroke=0)
+    c.setFillColor(colors.white)
+    c.setFont("Helvetica-Bold", 7)
+    c.drawCentredString(x1 + card_w - 38, y_pos + card_h - 28, "NT")
+    c.drawCentredString(x1 + card_w - 16, y_pos + card_h - 28, "RJ")
+
+    # Front Details Grid
+    c.setFillColor(colors.black)
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(x1 + 15, y_pos + 165, "Regn. No")
+    c.drawString(x1 + 105, y_pos + 165, "Date of Regn.")
+    c.drawString(x1 + 195, y_pos + 165, "Regn. Validity")
+    c.drawString(x1 + 295, y_pos + 165, "Owner Serial")
+
+    c.setFont("Helvetica", 7.5)
+    c.drawString(x1 + 15, y_pos + 153, regn_no)
+    c.drawString(x1 + 105, y_pos + 153, regn_dt)
+    c.drawString(x1 + 195, y_pos + 153, validity)
+    c.drawString(x1 + 310, y_pos + 153, "1")
+
+    # Chassis & Engine
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(x1 + 15, y_pos + 138, "Chassis Number:")
+    c.setFont("Helvetica", 7.5)
+    c.drawString(x1 + 115, y_pos + 138, chassis)
+
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(x1 + 15, y_pos + 123, "Engine Number:")
+    c.setFont("Helvetica", 7.5)
+    c.drawString(x1 + 115, y_pos + 123, engine_no)
+
+    # Owner & Father Name
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(x1 + 15, y_pos + 108, "Owner Name:")
+    c.setFont("Helvetica", 7.5)
+    c.drawString(x1 + 115, y_pos + 108, owner_name)
+
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(x1 + 15, y_pos + 93, "Father/Husband:")
+    c.setFont("Helvetica", 7.5)
+    c.drawString(x1 + 115, y_pos + 93, father_name)
+
+    # Address
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(x1 + 15, y_pos + 78, "Address:")
+    c.setFont("Helvetica", 7)
+    addr_line1 = address[:45]
+    addr_line2 = address[45:90]
+    c.drawString(x1 + 115, y_pos + 78, addr_line1)
     if addr_line2:
-        pattern = r'(_address_line_placeholder_match_)?(ff1 fs2 fc0 sc0 ls0 ws0">' + re.escape(addr_line1) + r'</div>\s*<div class="[^"]*ff1 fs2 fc0 sc0 ls0 ws0">)</div>'
-        html = re.sub(
-            pattern,
-            r'\2' + addr_line2 + r'</div>',
-            html,
-            count=1
-        )
+        c.drawString(x1 + 115, y_pos + 68, addr_line2)
 
-    html = html.replace(">PETROL<",                    f">{fuel}<")
-    html = html.replace(">BHARAT STAGE II<",           f">{norms}<")
-    html = html.replace(">VEHICLE CLASS : TWO WHEELER(NT)<",
-                        f">VEHICLE CLASS : {veh_cat}<")
-    html = html.replace(">TVS MOTOR COMPANY LTD<",     f">{maker}<")
-    html = html.replace(">TVS WEGO<",                  f">{model}<")
-    html = html.replace(">BROWN<",                     f">{color}<")
-    html = html.replace(">SOLO<",                      f">{body_type}<")
-    html = html.replace(">110.00<",                    f">{cubic_cap}<")
-    html = html.replace(">No of Cylinders : 1<",       f">No of Cylinders : {no_cyl}<")
-    html = html.replace(">4/2011<",                    f">{mfg_my}<")
-    html = html.replace(">BHILWARA DTO, Rajasthan<",   f">{reg_authority}<")
-    html = html.replace(">Card Issue Date (04-2011)<",
-                        f">Card Issue Date ({issue_date})<")
+    # Fuel & Norms
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(x1 + 15, y_pos + 50, "Fuel:")
+    c.setFont("Helvetica", 7.5)
+    c.drawString(x1 + 50, y_pos + 50, fuel)
 
-    html = re.sub(
-        r'(Seating in all Capacity</div>.*?ff1.*?>)2(<)',
-        lambda m: m.group(1) + seat_cap + m.group(2),
-        html, flags=re.DOTALL
-    )
-    html = re.sub(
-        r'(Unladen Weight Kg</div>.*?ff1.*?>)110(<)',
-        lambda m: m.group(1) + unld_wt + m.group(2),
-        html, flags=re.DOTALL
-    )
-    return html
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(x1 + 150, y_pos + 50, "Emission Norms:")
+    c.setFont("Helvetica", 7.5)
+    c.drawString(x1 + 235, y_pos + 50, "BHARAT STAGE IV")
 
+    # ---------------- BACK CARD ----------------
+    x2 = 435
+    c.setFillColor(colors.HexColor("#eef7fc"))
+    c.roundRect(x2, y_pos, card_w, card_h, 8, fill=1, stroke=1)
 
-def random_headers() -> dict:
-    ua_templates = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{v}.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{v}.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{v}.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Linux; Android {a}; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{v}.0.0.0 Mobile Safari/537.36",
-    ]
-    chrome_ver = random.randint(120, 137)
-    android_ver = random.randint(10, 15)
-    ua = random.choice(ua_templates).format(v=chrome_ver, a=android_ver)
-    return {
-        "accept": "*/*",
-        "content-type": "application/json",
-        "origin": "https://www.allimagetools.com",
-        "referer": "https://www.allimagetools.com/html-to-image",
-        "user-agent": ua,
-    }
+    # Header
+    c.setFillColor(colors.HexColor("#002855"))
+    c.setFont("Helvetica-Bold", 8.5)
+    c.drawString(x2 + 55, y_pos + card_h - 22, f"VEHICLE CLASS : {veh_cat}")
 
+    # QR Code
+    qr_code = qr.QrCodeWidget(f"RC:{regn_no}|CH:{chassis}|ENG:{engine_no}")
+    qr_code.barWidth = 65
+    qr_code.barHeight = 65
+    d = Drawing(65, 65)
+    d.add(qr_code)
+    d.drawOn(c, x2 + 15, y_pos + 95)
 
-def html_to_image(html: str) -> bytes:
-    payload = {
-        "html": html,
-        "width": 894,
-        "height": 1264,
-        "isMobile": False,
-        "fullPage": True,
-        "format": "png",
-        "quality": 90,
-        "scale": 3,
-        "darkMode": False,
-        "delay": 0,
-        "customCss": "",
-        "hideElements": "",
-    }
-    headers = random_headers()
-    resp = requests.post(IMG_API_URL, json=payload, headers=headers, timeout=60)
-    resp.raise_for_status()
-    b64 = resp.json().get("image")
-    if not b64:
-        raise ValueError("AllImageTools API did not return a base64 image")
-    b64_clean = re.sub(r"^data:image/\w+;base64,", "", b64)
-    return base64.b64decode(b64_clean)
+    # Back Specs
+    c.setFillColor(colors.black)
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(x2 + 15, y_pos + 185, "Regn. Number:")
+    c.setFont("Helvetica", 7.5)
+    c.drawString(x2 + 15, y_pos + 172, regn_no)
 
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(x2 + 100, y_pos + 165, "Maker:")
+    c.setFont("Helvetica", 7.5)
+    c.drawString(x2 + 150, y_pos + 165, maker)
 
-def image_to_pdf(img_bytes: bytes) -> bytes:
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    pdf_buf = io.BytesIO()
-    img.save(pdf_buf, "PDF")
-    return pdf_buf.getvalue()
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(x2 + 100, y_pos + 150, "Model:")
+    c.setFont("Helvetica", 7.5)
+    c.drawString(x2 + 150, y_pos + 150, model)
+
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(x2 + 100, y_pos + 135, "Color / Body:")
+    c.setFont("Helvetica", 7.5)
+    c.drawString(x2 + 170, y_pos + 135, f"{color} / SALOON")
+
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(x2 + 100, y_pos + 120, "Seating Cap:")
+    c.setFont("Helvetica", 7.5)
+    c.drawString(x2 + 170, y_pos + 120, seat_cap)
+
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(x2 + 100, y_pos + 105, "Unladen Wt:")
+    c.setFont("Helvetica", 7.5)
+    c.drawString(x2 + 170, y_pos + 105, f"{unld_wt} Kg")
+
+    c.setFont("Helvetica-Bold", 7.5)
+    c.drawString(x2 + 15, y_pos + 65, f"Mfg Month-Year: {mfg_my}")
+    c.drawString(x2 + 170, y_pos + 65, f"Cubic Cap: {cubic_cap}")
+    c.drawString(x2 + 15, y_pos + 45, f"Reg Authority: {reg_authority}")
+    c.drawString(x2 + 15, y_pos + 25, f"Card Issue Date: {issue_date}")
+
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf.getvalue()
 
 
 @app.route("/rc")
 def rc_pdf():
     start_time = time.time()
     current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
     vehicle = request.args.get("vehicle", "").strip().upper()
+
     if not vehicle:
         return jsonify({
             "status": "error",
@@ -266,13 +262,8 @@ def rc_pdf():
 
     try:
         data = fetch_rc_data(vehicle)
-        html = build_html(data)
-        img_bytes = html_to_image(html)
-        pdf_bytes = image_to_pdf(img_bytes)
-
-        # Convert generated PDF to Base64 String
+        pdf_bytes = generate_rc_pdf_bytes(data)
         pdf_base64 = base64.b64encode(pdf_bytes).decode("utf-8")
-        execution_time = f"{round(time.time() - start_time, 3)}s"
 
         return jsonify({
             "status": "success",
@@ -280,70 +271,23 @@ def rc_pdf():
             "timestamp": current_timestamp,
             "rcno": vehicle,
             "pdf": pdf_base64,
-            "execution_time": execution_time
+            "execution_time": f"{round(time.time() - start_time, 3)}s"
         }), 200
 
     except Exception as exc:
-        execution_time = f"{round(time.time() - start_time, 3)}s"
         return jsonify({
             "status": "error",
             "message": str(exc),
             "timestamp": current_timestamp,
             "rcno": vehicle,
             "pdf": None,
-            "execution_time": execution_time
+            "execution_time": f"{round(time.time() - start_time, 3)}s"
         }), 500
-
-
-@app.route("/rcimg")
-def rc_image():
-    vehicle = request.args.get("vehicle", "").strip().upper()
-    if not vehicle:
-        return jsonify({"error": "vehicle parameter required"}), 400
-
-    try:
-        data = fetch_rc_data(vehicle)
-        html = build_html(data)
-        img_bytes = html_to_image(html)
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-
-    img_io = io.BytesIO(img_bytes)
-    img_io.seek(0)
-    return send_file(
-        img_io,
-        mimetype="image/png",
-        as_attachment=True,
-        download_name=f"RC_{vehicle}.png"
-    )
-
-
-@app.route("/rchtml")
-def rc_html():
-    vehicle = request.args.get("vehicle", "").strip().upper()
-    if not vehicle:
-        return jsonify({"error": "vehicle parameter required"}), 400
-
-    try:
-        data = fetch_rc_data(vehicle)
-        html = build_html(data)
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-
-    return Response(html, mimetype="text/html")
 
 
 @app.route("/")
 def index():
-    return (
-        "<h2>RC Card API</h2>"
-        "<p>Available Routes:</p>"
-        "<ul>"
-        "<li><code>/rc?vehicle=UP41AJ1765</code> — Returns JSON with Base64 PDF</li>"
-        "<li><code>/rcimg?vehicle=UP41AJ1765</code> — Direct Image Download</li>"
-        "<li><code>/rchtml?vehicle=UP41AJ1765</code> — Returns raw HTML</li>"
-        "</ul>"
-    )
+    return jsonify({"message": "Fast Direct PDF API Running", "route": "/rc?vehicle=MH01AB1234"})
 
 
 if __name__ == "__main__":
