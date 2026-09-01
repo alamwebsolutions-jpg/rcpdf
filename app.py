@@ -3,6 +3,8 @@ import os
 import re
 import random
 import base64
+import time
+from datetime import datetime
 import requests
 from flask import Flask, request, jsonify, Response, send_file
 from PIL import Image
@@ -24,7 +26,7 @@ def fetch_rc_data(vehicle_no: str) -> dict:
             if data1.get("statusCode") == 200 and "response" in data1:
                 return data1["response"]
     except Exception:
-        pass # Agar API 1 fail hui toh aage API 2 par jayega
+        pass
 
     # --- ATTEMPT 2: Secondary API (Fallback) ---
     api_2_url = "https://vehiclev2.vk177384.workers.dev/"
@@ -32,16 +34,13 @@ def fetch_rc_data(vehicle_no: str) -> dict:
         resp2 = requests.get(api_2_url, params={"number": vehicle_no, "api_key": "sneha"}, timeout=30)
         if resp2.status_code == 200:
             data2 = resp2.json()
-            # Agar structure pehli API jaisa hai
             if data2.get("statusCode") == 200 and "response" in data2:
                 return data2["response"]
-            # Agar secondary API direct data return karti hai
             elif "regNo" in data2 or "chassis" in data2:
                 return data2
     except Exception:
-        pass # Agar dono fail ho gaye
+        pass
 
-    # Agar dono API se koi data nahi mila
     raise ValueError(f"No data found or both APIs failed for vehicle {vehicle_no!r}")
 
 
@@ -58,7 +57,6 @@ def extract_state(rto_data: dict) -> str:
 
 
 def card_issue_date(regn_dt: str) -> str:
-    """Convert DD/MM/YYYY or D/M/YYYY to MM-YYYY"""
     if not regn_dt:
         return ""
     parts = regn_dt.split("/")
@@ -69,7 +67,6 @@ def card_issue_date(regn_dt: str) -> str:
 
 
 def format_date_to_card(date_str: str) -> str:
-    """Converts D/M/YYYY to DD-MMM-YYYY format matching template placeholders"""
     if not date_str:
         return ""
     months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -88,7 +85,6 @@ def format_date_to_card(date_str: str) -> str:
 
 
 def split_address(address_str: str, max_chars: int = 35) -> tuple:
-    """Splits address into two lines seamlessly without breaking words"""
     if len(address_str) <= max_chars:
         return address_str, ""
 
@@ -254,38 +250,49 @@ def image_to_pdf(img_bytes: bytes) -> bytes:
 
 @app.route("/rc")
 def rc_pdf():
+    start_time = time.time()
+    current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     vehicle = request.args.get("vehicle", "").strip().upper()
     if not vehicle:
-        return jsonify({"error": "vehicle parameter required"}), 400
+        return jsonify({
+            "status": "error",
+            "message": "vehicle parameter required",
+            "timestamp": current_timestamp,
+            "rcno": vehicle,
+            "pdf": None,
+            "execution_time": f"{round(time.time() - start_time, 3)}s"
+        }), 400
 
     try:
         data = fetch_rc_data(vehicle)
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-
-    try:
         html = build_html(data)
-    except Exception as exc:
-        return jsonify({"error": f"Template error: {exc}"}), 500
-
-    try:
         img_bytes = html_to_image(html)
-    except Exception as exc:
-        return jsonify({"error": f"Image generation failed: {exc}"}), 500
-
-    try:
         pdf_bytes = image_to_pdf(img_bytes)
-    except Exception as exc:
-        return jsonify({"error": f"PDF conversion failed: {exc}"}), 500
 
-    pdf_io = io.BytesIO(pdf_bytes)
-    pdf_io.seek(0)
-    return send_file(
-        pdf_io, 
-        mimetype="application/pdf", 
-        as_attachment=True, 
-        download_name=f"RC_{vehicle}.pdf"
-    )
+        # Convert generated PDF to Base64 String
+        pdf_base64 = base64.b64encode(pdf_bytes).decode("utf-8")
+        execution_time = f"{round(time.time() - start_time, 3)}s"
+
+        return jsonify({
+            "status": "success",
+            "message": "RC PDF fetched successfully",
+            "timestamp": current_timestamp,
+            "rcno": vehicle,
+            "pdf": pdf_base64,
+            "execution_time": execution_time
+        }), 200
+
+    except Exception as exc:
+        execution_time = f"{round(time.time() - start_time, 3)}s"
+        return jsonify({
+            "status": "error",
+            "message": str(exc),
+            "timestamp": current_timestamp,
+            "rcno": vehicle,
+            "pdf": None,
+            "execution_time": execution_time
+        }), 500
 
 
 @app.route("/rcimg")
@@ -296,25 +303,17 @@ def rc_image():
 
     try:
         data = fetch_rc_data(vehicle)
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-
-    try:
         html = build_html(data)
-    except Exception as exc:
-        return jsonify({"error": f"Template error: {exc}"}), 500
-
-    try:
         img_bytes = html_to_image(html)
     except Exception as exc:
-        return jsonify({"error": f"Image generation failed: {exc}"}), 500
+        return jsonify({"error": str(exc)}), 500
 
     img_io = io.BytesIO(img_bytes)
     img_io.seek(0)
     return send_file(
-        img_io, 
-        mimetype="image/png", 
-        as_attachment=True, 
+        img_io,
+        mimetype="image/png",
+        as_attachment=True,
         download_name=f"RC_{vehicle}.png"
     )
 
@@ -327,13 +326,9 @@ def rc_html():
 
     try:
         data = fetch_rc_data(vehicle)
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-
-    try:
         html = build_html(data)
     except Exception as exc:
-        return jsonify({"error": f"Template error: {exc}"}), 500
+        return jsonify({"error": str(exc)}), 500
 
     return Response(html, mimetype="text/html")
 
@@ -341,14 +336,15 @@ def rc_html():
 @app.route("/")
 def index():
     return (
-        "<h2>RC Card PDF Generator</h2>"
+        "<h2>RC Card API</h2>"
         "<p>Available Routes:</p>"
         "<ul>"
-        "<li><code>/rc?vehicle=HR26EV0001</code> — Direct PDF Download</li>"
-        "<li><code>/rcimg?vehicle=HR26EV0001</code> — Direct Image Download</li>"
-        "<li><code>/rchtml?vehicle=HR26EV0001</code> — Returns raw HTML</li>"
+        "<li><code>/rc?vehicle=UP41AJ1765</code> — Returns JSON with Base64 PDF</li>"
+        "<li><code>/rcimg?vehicle=UP41AJ1765</code> — Direct Image Download</li>"
+        "<li><code>/rchtml?vehicle=UP41AJ1765</code> — Returns raw HTML</li>"
         "</ul>"
     )
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
